@@ -1,0 +1,428 @@
+From b7fcdf3351b0aba2873c352381934da8ed56cb27 Mon Sep 17 00:00:00 2001
+From: David Maier <david@nosqlgeeks.de>
+Date: Fri, 1 Feb 2019 13:03:46 +0100
+Subject: [PATCH 1/2] Added wait strategies to Jedis; Modified SentinelPool to
+ tollerate Sentinel failovers
+
+---
+ .../clients/jedis/JedisSentinelPool.java      | 23 ++++--
+ .../clients/jedis/wait/ExponentialWait.java   | 78 +++++++++++++++++++
+ .../redis/clients/jedis/wait/IEvaluator.java  | 16 ++++
+ .../clients/jedis/wait/IWaitStrategy.java     | 18 +++++
+ .../clients/jedis/wait/SentinelUpEval.java    | 59 ++++++++++++++
+ .../redis/clients/jedis/wait/SimpleWait.java  | 29 +++++++
+ .../redis/clients/jedis/wait/TimerEval.java   | 50 ++++++++++++
+ .../jedis/tests/wait/ExponentialWaitTest.java | 49 ++++++++++++
+ 8 files changed, 315 insertions(+), 7 deletions(-)
+ create mode 100644 src/main/java/redis/clients/jedis/wait/ExponentialWait.java
+ create mode 100644 src/main/java/redis/clients/jedis/wait/IEvaluator.java
+ create mode 100644 src/main/java/redis/clients/jedis/wait/IWaitStrategy.java
+ create mode 100644 src/main/java/redis/clients/jedis/wait/SentinelUpEval.java
+ create mode 100644 src/main/java/redis/clients/jedis/wait/SimpleWait.java
+ create mode 100644 src/main/java/redis/clients/jedis/wait/TimerEval.java
+ create mode 100644 src/test/java/redis/clients/jedis/tests/wait/ExponentialWaitTest.java
+
+diff --git a/src/main/java/redis/clients/jedis/JedisSentinelPool.java b/src/main/java/redis/clients/jedis/JedisSentinelPool.java
+index ec1c98c9..44fd8c31 100644
+--- a/src/main/java/redis/clients/jedis/JedisSentinelPool.java
++++ b/src/main/java/redis/clients/jedis/JedisSentinelPool.java
+@@ -12,6 +12,10 @@ import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
+ 
+ import redis.clients.jedis.exceptions.JedisConnectionException;
+ import redis.clients.jedis.exceptions.JedisException;
++import redis.clients.jedis.wait.ExponentialWait;
++import redis.clients.jedis.wait.IEvaluator;
++import redis.clients.jedis.wait.IWaitStrategy;
++import redis.clients.jedis.wait.SentinelUpEval;
+ import redis.clients.util.Pool;
+ 
+ public class JedisSentinelPool extends Pool<Jedis> {
+@@ -254,7 +258,10 @@ public class JedisSentinelPool extends Pool<Jedis> {
+     protected String masterName;
+     protected String host;
+     protected int port;
+-    protected long subscribeRetryWaitTimeMillis = 5000;
++
++    protected IEvaluator eval;
++    protected IWaitStrategy wait;
++
+     protected volatile Jedis j;
+     protected AtomicBoolean running = new AtomicBoolean(false);
+ 
+@@ -266,12 +273,13 @@ public class JedisSentinelPool extends Pool<Jedis> {
+       this.masterName = masterName;
+       this.host = host;
+       this.port = port;
++      this.eval = new SentinelUpEval(host, port);
++      this.wait = new ExponentialWait(eval);
+     }
+ 
+-    public MasterListener(String masterName, String host, int port,
+-        long subscribeRetryWaitTimeMillis) {
++    public MasterListener(String masterName, String host, int port, IWaitStrategy wait) {
+       this(masterName, host, port);
+-      this.subscribeRetryWaitTimeMillis = subscribeRetryWaitTimeMillis;
++      this.wait = wait;
+     }
+ 
+     @Override
+@@ -327,11 +335,12 @@ public class JedisSentinelPool extends Pool<Jedis> {
+ 
+           if (running.get()) {
+             log.log(Level.SEVERE, "Lost connection to Sentinel at " + host + ":" + port
+-                + ". Sleeping 5000ms and retrying.", e);
++                + ". Waiting ...", e);
++
+             try {
+-              Thread.sleep(subscribeRetryWaitTimeMillis);
++              wait.waitFor();
+             } catch (InterruptedException e1) {
+-              log.log(Level.SEVERE, "Sleep interrupted: ", e1);
++              log.log(Level.SEVERE, "Waiting interrupted: ", e1);
+             }
+           } else {
+             log.fine("Unsubscribing from Sentinel at " + host + ":" + port);
+diff --git a/src/main/java/redis/clients/jedis/wait/ExponentialWait.java b/src/main/java/redis/clients/jedis/wait/ExponentialWait.java
+new file mode 100644
+index 00000000..17d09763
+--- /dev/null
++++ b/src/main/java/redis/clients/jedis/wait/ExponentialWait.java
+@@ -0,0 +1,78 @@
++package redis.clients.jedis.wait;
++
++/**
++ *
++ */
++public class ExponentialWait implements IWaitStrategy {
++
++
++    /**
++     * Default values
++     *
++     * 1000 * 2^x; x<=8
++     *
++     */
++    private long waitTime = 1000;
++    private int retryFactor = 2;
++    private int maxRetries = 8;
++    private IEvaluator eval = null;
++
++
++
++    /**
++     * Full constructor
++     *
++     * @param waitTime
++     * @param retryFactor
++     * @param maxRetries
++     */
++    public ExponentialWait(long waitTime, int retryFactor, int maxRetries, IEvaluator eval) {
++
++        this(eval);
++        this.waitTime = waitTime;
++        this.retryFactor = retryFactor;
++        this.maxRetries = maxRetries;
++
++    }
++
++    /**
++     * Constructor which is using the default settings
++     *
++     * @param eval
++     */
++    public ExponentialWait(IEvaluator eval) {
++
++        this.eval = eval;
++    }
++
++
++    /**
++     * Wait until the max. number of retries is reached or until
++     * the
++     * @throws InterruptedException
++     */
++    @Override
++    public void waitFor() throws InterruptedException {
++
++        int numErr = 0;
++        boolean isWaiting = true;
++        long currWait =  waitTime;
++
++        while (isWaiting) {
++
++            if (eval.check()) {
++
++                isWaiting = false;
++
++            } else {
++
++                numErr++;
++
++                Thread.sleep(currWait);
++
++                currWait = currWait*retryFactor;
++                if (numErr == maxRetries) isWaiting = false;
++            }
++        }
++    }
++}
+diff --git a/src/main/java/redis/clients/jedis/wait/IEvaluator.java b/src/main/java/redis/clients/jedis/wait/IEvaluator.java
+new file mode 100644
+index 00000000..e3916f84
+--- /dev/null
++++ b/src/main/java/redis/clients/jedis/wait/IEvaluator.java
+@@ -0,0 +1,16 @@
++package redis.clients.jedis.wait;
++
++/**
++ * An evaluator has a single method in order to check
++ * if an external condition is true
++ */
++public interface IEvaluator {
++
++    /**
++     * Chack if the condition is true
++     *
++     * @return
++     */
++     boolean check();
++
++}
+diff --git a/src/main/java/redis/clients/jedis/wait/IWaitStrategy.java b/src/main/java/redis/clients/jedis/wait/IWaitStrategy.java
+new file mode 100644
+index 00000000..83cb1f68
+--- /dev/null
++++ b/src/main/java/redis/clients/jedis/wait/IWaitStrategy.java
+@@ -0,0 +1,18 @@
++package redis.clients.jedis.wait;
++
++/**
++ * Describes a Wait strategy. A wait strategy
++ * is implemented by implementing the method
++ * waitFor. All relevant parameters should be passed
++ * to the constructor.
++ */
++public interface IWaitStrategy {
++
++    /**
++     * Wait based on the wait strategy
++     *
++     * @throws InterruptedException
++     */
++     void waitFor() throws InterruptedException;
++
++}
+diff --git a/src/main/java/redis/clients/jedis/wait/SentinelUpEval.java b/src/main/java/redis/clients/jedis/wait/SentinelUpEval.java
+new file mode 100644
+index 00000000..4bd5cd4d
+--- /dev/null
++++ b/src/main/java/redis/clients/jedis/wait/SentinelUpEval.java
+@@ -0,0 +1,59 @@
++package redis.clients.jedis.wait;
++
++import redis.clients.jedis.Jedis;
++import redis.clients.jedis.exceptions.JedisConnectionException;
++
++public class SentinelUpEval implements IEvaluator {
++
++    public static final int CONN_TIMEOUT = 500;
++
++
++    /**
++     * The Sentinel host
++     */
++    private String host;
++
++    /**
++     * The Sentinel port
++     */
++    private int port;
++
++    /**
++     * Redis client
++     */
++    private Jedis client;
++
++    /**
++     * Constructor
++     *
++     * @param host
++     * @param port
++     */
++    public SentinelUpEval(String host, int port) {
++
++        this.host = host;
++        this.port = port;
++        this.client = new Jedis(host, port);
++    }
++
++
++    /**
++     * Check if the Sentinel is reachable
++     *
++     * @return
++     */
++    public boolean check() {
++
++        try {
++
++            client = new Jedis(this.host, this.port, CONN_TIMEOUT);
++            client.connect();
++            client.disconnect();
++            return true;
++
++        } catch (JedisConnectionException e) {
++
++            return false;
++        }
++    }
++}
+diff --git a/src/main/java/redis/clients/jedis/wait/SimpleWait.java b/src/main/java/redis/clients/jedis/wait/SimpleWait.java
+new file mode 100644
+index 00000000..08117129
+--- /dev/null
++++ b/src/main/java/redis/clients/jedis/wait/SimpleWait.java
+@@ -0,0 +1,29 @@
++package redis.clients.jedis.wait;
++
++public class SimpleWait implements IWaitStrategy {
++
++    /**
++     * Time to wait for in ms
++     */
++    private long time;
++
++    /**
++     * Default Cto
++     *
++     * @param time
++     */
++    public SimpleWait(long time) {
++        this.time = time;
++    }
++
++    /**
++     * Wait for a specific time in ms
++     *
++     * @throws InterruptedException
++     */
++    @Override
++    public void waitFor() throws InterruptedException {
++
++        Thread.sleep(time);
++    }
++}
+diff --git a/src/main/java/redis/clients/jedis/wait/TimerEval.java b/src/main/java/redis/clients/jedis/wait/TimerEval.java
+new file mode 100644
+index 00000000..f7ccfd0e
+--- /dev/null
++++ b/src/main/java/redis/clients/jedis/wait/TimerEval.java
+@@ -0,0 +1,50 @@
++package redis.clients.jedis.wait;
++
++
++import java.util.Date;
++
++/**
++ * A simple time based evaluation
++ *
++ * Checks if the duration is already over
++ */
++public class TimerEval implements IEvaluator {
++
++    private long startTime = -1;
++    private long endTime;
++    private long duration;
++
++
++    /**
++     * The constructor which takes the duration
++     *
++     * @param duration
++     */
++    public TimerEval(long duration) {
++
++        this.duration = duration;
++    }
++
++    /**
++     * Check if the duration was reached
++     * @return
++     */
++    @Override
++    public boolean check() {
++
++        if (startTime == -1) {
++
++            startTime = new Date().getTime();
++
++        } else {
++
++            endTime = new Date().getTime();
++
++            if ((endTime - startTime) >= duration)
++                return true;
++        }
++
++        //Return false by default
++        return false;
++    }
++}
+diff --git a/src/test/java/redis/clients/jedis/tests/wait/ExponentialWaitTest.java b/src/test/java/redis/clients/jedis/tests/wait/ExponentialWaitTest.java
+new file mode 100644
+index 00000000..fe71809b
+--- /dev/null
++++ b/src/test/java/redis/clients/jedis/tests/wait/ExponentialWaitTest.java
+@@ -0,0 +1,49 @@
++package redis.clients.jedis.tests.wait;
++
++import static org.junit.Assert.assertTrue;
++
++import org.junit.Test;
++import redis.clients.jedis.wait.ExponentialWait;
++import redis.clients.jedis.wait.IWaitStrategy;
++import redis.clients.jedis.wait.TimerEval;
++
++import java.util.Date;
++
++public class ExponentialWaitTest {
++
++
++    @Test
++    public void waitEvalSuccessTest() throws InterruptedException {
++
++        System.out.println("-- waitEvalSuccessTest");
++
++        long start = new Date().getTime();
++
++        //We are waiting at least 10 seconds
++        IWaitStrategy wait = new ExponentialWait( new TimerEval(10000));
++        wait.waitFor();
++
++        long diff = new Date().getTime() - start;
++        assertTrue(diff >= 10000 );
++        System.out.println("We waited in total: " + diff + " ms");
++
++    }
++
++    @Test
++    public void waitEvalFailedTest() throws InterruptedException {
++
++        System.out.println("-- waitEvalFailedTest");
++
++        long start = new Date().getTime();
++
++        //We are waiting at least 60 seconds
++        //Wait for 1000 * 2^5 = 32 seconds, whereby the evaluator will return true after 40 seconds
++        IWaitStrategy wait = new ExponentialWait(1000, 2, 5, new TimerEval(40000));
++        wait.waitFor();
++
++        long diff = new Date().getTime() - start;
++        assertTrue(diff >= 30000 && diff <= 40000 );
++        System.out.println("We waited in total: " + diff + " ms");
++
++    }
++}
+-- 
+2.17.2 (Apple Git-113)
+
